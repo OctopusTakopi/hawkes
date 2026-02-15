@@ -1,0 +1,343 @@
+//! # hawkes
+//!
+//! A high-performance Hawkes Process library for modeling and fitting self-exciting point processes.
+//!
+//! ## Overview
+//! A Hawkes process is a type of point process where the arrival of an event increases the probability
+//! of future events. This library provides tools for:
+//! - **Modeling**: Single or multi-scale (Sum of Exponentials) kernels.
+//! - **Fitting**: Estimating parameters from historical data using Maximum Likelihood Estimation (MLE).
+//! - **Real-time Evaluation**: Efficient $O(1)$ and $O(K)$ updates.
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum HawkesError {
+    #[error("decay parameter beta must be positive (got {0})")]
+    InvalidBeta(f64),
+    #[error("alphas number ({0}) and betas number ({1}) must be equal")]
+    DimensionMismatch(usize, usize),
+    #[error("number of scales k must be at least 2 for log-spacing (got {0})")]
+    InvalidLogSpacing(usize),
+    #[error("optimization failed: {0}")]
+    FittingError(String),
+}
+
+/// Start with a Result type for better error handling.
+pub type HawkesResult<T> = Result<T, HawkesError>;
+
+pub mod fitting;
+
+/// A trait representing a generic Hawkes Process model.
+/// This allows for interchangeable use of different kernels (Exponential, SumExp, PowerLaw).
+pub trait HawkesModel {
+    /// Updates the state with a new event and returns the new excitation level.
+    fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64;
+    /// Returns the theoretical excitation at `timestamp_ms` without updating state.
+    fn evaluate(&self, timestamp_ms: u64) -> f64;
+    /// Returns the current excitation level immediately after the last update.
+    fn current_excitation(&self) -> f64;
+    /// Returns the total intensity (lambda) = mu + excitation.
+    fn intensity(&self) -> f64;
+}
+
+/// Computes the Hawkes excitation component iteratively in O(1) time.
+/// Uses a single exponential kernel: g(t) = alpha * exp(-beta * t)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HawkesExcitation {
+    pub mu: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub current_excitation: f64,
+    pub last_timestamp_sec: Option<f64>,
+}
+
+impl HawkesExcitation {
+    pub fn new(mu: f64, alpha: f64, beta: f64) -> HawkesResult<Self> {
+        if beta <= 0.0 {
+            return Err(HawkesError::InvalidBeta(beta));
+        }
+        Ok(Self {
+            mu,
+            alpha,
+            beta,
+            current_excitation: 0.0,
+            last_timestamp_sec: None,
+        })
+    }
+
+    pub fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        let current_time_sec = timestamp_ms as f64 / 1000.0;
+        let jump = match volume {
+            Some(v) => self.alpha * v,
+            None => self.alpha,
+        };
+
+        if let Some(last_time) = self.last_timestamp_sec {
+            let delta_t = (current_time_sec - last_time).max(0.0);
+            self.current_excitation = self.current_excitation * (-self.beta * delta_t).exp() + jump;
+        } else {
+            self.current_excitation = jump;
+        }
+
+        self.last_timestamp_sec = Some(current_time_sec);
+        self.current_excitation
+    }
+
+    pub fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        if let Some(last_time) = self.last_timestamp_sec {
+            let current_time_sec = timestamp_ms as f64 / 1000.0;
+            let delta_t = (current_time_sec - last_time).max(0.0);
+            self.current_excitation * (-self.beta * delta_t).exp()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn current_excitation(&self) -> f64 {
+        self.current_excitation
+    }
+
+    pub fn intensity(&self) -> f64 {
+        // Note: strictly speaking intensity() is usually asked at "current time".
+        // If we want intensity immediately after update:
+        self.mu + self.current_excitation
+    }
+}
+
+impl HawkesModel for HawkesExcitation {
+    fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        self.update(timestamp_ms, volume)
+    }
+
+    fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        self.evaluate(timestamp_ms)
+    }
+
+    fn current_excitation(&self) -> f64 {
+        self.current_excitation()
+    }
+
+    fn intensity(&self) -> f64 {
+        self.intensity()
+    }
+}
+
+/// Sum of Exponentials Hawkes process: g(t) = sum(alpha_i * exp(-beta_i * t))
+/// Maintains O(K) complexity where K is the number of exponentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SumExpHawkes {
+    pub mu: f64,
+    pub alphas: Vec<f64>,
+    pub betas: Vec<f64>,
+    pub excitations: Vec<f64>,
+    pub last_timestamp_sec: Option<f64>,
+}
+
+impl SumExpHawkes {
+    /// Fits the model parameters (mu, alphas) to the given timestamps using Maximum Likelihood Estimation.
+    /// The `betas` are fixed hyperparameters (timescales).
+    pub fn fit(timestamps: Vec<f64>, fixed_betas: Vec<f64>) -> HawkesResult<Self> {
+        let (mu, alphas) = fitting::fit_hawkes(timestamps, fixed_betas.clone())
+            .map_err(|e| HawkesError::FittingError(e.to_string()))?;
+        Self::new(mu, alphas, fixed_betas)
+    }
+
+    pub fn new(mu: f64, alphas: Vec<f64>, betas: Vec<f64>) -> HawkesResult<Self> {
+        if alphas.len() != betas.len() {
+            return Err(HawkesError::DimensionMismatch(alphas.len(), betas.len()));
+        }
+        for &beta in &betas {
+            if beta <= 0.0 {
+                return Err(HawkesError::InvalidBeta(beta));
+            }
+        }
+        let k = alphas.len();
+        Ok(Self {
+            mu,
+            alphas,
+            betas,
+            excitations: vec![0.0; k],
+            last_timestamp_sec: None,
+        })
+    }
+
+    pub fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        let current_time_sec = timestamp_ms as f64 / 1000.0;
+        let volume_factor = volume.unwrap_or(1.0);
+
+        if let Some(last_time) = self.last_timestamp_sec {
+            let delta_t = (current_time_sec - last_time).max(0.0);
+
+            // Optimized using iterators instead of index lookups
+            let iter = self
+                .excitations
+                .iter_mut()
+                .zip(self.alphas.iter())
+                .zip(self.betas.iter());
+
+            for ((excitation, &alpha), &beta) in iter {
+                let jump = alpha * volume_factor;
+                *excitation = *excitation * (-beta * delta_t).exp() + jump;
+            }
+        } else {
+            for (excitation, &alpha) in self.excitations.iter_mut().zip(self.alphas.iter()) {
+                *excitation = alpha * volume_factor;
+            }
+        }
+
+        self.last_timestamp_sec = Some(current_time_sec);
+        self.current_excitation()
+    }
+
+    pub fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        if let Some(last_time) = self.last_timestamp_sec {
+            let current_time_sec = timestamp_ms as f64 / 1000.0;
+            let delta_t = (current_time_sec - last_time).max(0.0);
+
+            self.excitations
+                .iter()
+                .zip(self.betas.iter())
+                .map(|(&excitation, &beta)| excitation * (-beta * delta_t).exp())
+                .sum()
+        } else {
+            0.0
+        }
+    }
+
+    pub fn current_excitation(&self) -> f64 {
+        self.excitations.iter().sum()
+    }
+
+    pub fn intensity(&self) -> f64 {
+        self.mu + self.current_excitation()
+    }
+}
+
+impl HawkesModel for SumExpHawkes {
+    fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        self.update(timestamp_ms, volume)
+    }
+
+    fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        self.evaluate(timestamp_ms)
+    }
+
+    fn current_excitation(&self) -> f64 {
+        self.current_excitation()
+    }
+
+    fn intensity(&self) -> f64 {
+        self.intensity()
+    }
+}
+
+/// Approximate Power Law Hawkes process using a log-spaced sum of exponentials.
+/// Power Law Kernel: g(t) = alpha / (delta + t)^beta
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApproxPowerLawHawkes {
+    inner: SumExpHawkes,
+}
+
+impl ApproxPowerLawHawkes {
+    /// Creates a new default log-spaced approximation.
+    pub fn new(mu: f64, alpha: f64, beta: f64, delta: f64, k: usize) -> HawkesResult<Self> {
+        if k < 2 {
+            return Err(HawkesError::InvalidLogSpacing(k));
+        }
+
+        let mut alphas = Vec::with_capacity(k);
+        let mut betas = Vec::with_capacity(k);
+
+        for i in 0..k {
+            // Log-spaced timescales from 0.001s to 100s
+            let b = 0.001 * 10.0f64.powf(i as f64 * 5.0 / (k - 1) as f64);
+            betas.push(b);
+            alphas.push(alpha / (k as f64 * (delta + 1.0 / b).powf(beta)));
+        }
+
+        Ok(Self {
+            inner: SumExpHawkes::new(mu, alphas, betas)?,
+        })
+    }
+
+    /// Creates an instance using manually specified scales (e.g. from offline fitting).
+    pub fn with_scales(mu: f64, alphas: Vec<f64>, betas: Vec<f64>) -> HawkesResult<Self> {
+        Ok(Self {
+            inner: SumExpHawkes::new(mu, alphas, betas)?,
+        })
+    }
+
+    pub fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        self.inner.update(timestamp_ms, volume)
+    }
+
+    pub fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        self.inner.evaluate(timestamp_ms)
+    }
+
+    pub fn current_excitation(&self) -> f64 {
+        self.inner.current_excitation()
+    }
+
+    pub fn intensity(&self) -> f64 {
+        self.inner.intensity()
+    }
+}
+
+impl HawkesModel for ApproxPowerLawHawkes {
+    fn update(&mut self, timestamp_ms: u64, volume: Option<f64>) -> f64 {
+        self.update(timestamp_ms, volume)
+    }
+
+    fn evaluate(&self, timestamp_ms: u64) -> f64 {
+        self.evaluate(timestamp_ms)
+    }
+
+    fn current_excitation(&self) -> f64 {
+        self.current_excitation()
+    }
+
+    fn intensity(&self) -> f64 {
+        self.intensity()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_evaluate_vs_update() {
+        let mut hawkes = HawkesExcitation::new(0.5, 1.0, 1.0).unwrap();
+
+        hawkes.update(0, None);
+        assert_eq!(hawkes.current_excitation(), 1.0);
+        assert_eq!(hawkes.intensity(), 1.5); // mu + excitation
+
+        let eval_val = hawkes.evaluate(1000);
+        assert!((eval_val - 0.3678).abs() < 0.01);
+
+        assert_eq!(hawkes.current_excitation(), 1.0);
+
+        hawkes.update(1000, None);
+        let cur = hawkes.current_excitation();
+        assert!((cur - 1.3678).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_serialization() {
+        let mut hawkes = HawkesExcitation::new(0.5, 1.0, 1.0).unwrap();
+        hawkes.update(0, None);
+
+        // Serialize
+        let json = serde_json::to_string(&hawkes).unwrap();
+
+        // Deserialize
+        let loaded: HawkesExcitation = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.current_excitation(), hawkes.current_excitation());
+        assert_eq!(loaded.mu, 0.5);
+    }
+}
