@@ -250,11 +250,18 @@ impl ApproxPowerLawHawkes {
         let mut alphas = Vec::with_capacity(k);
         let mut betas = Vec::with_capacity(k);
 
+        // Log-spacing width: betas span from 0.001 to 100 (5 decades in log10 = ln(10^5)).
+        // Each of the (k-1) intervals covers Δlog(β) = ln(10^5)/(k-1) in natural log space.
+        // This is the correct quadrature weight for the log-spaced approximation: instead of
+        // a uniform 1/k (which assumes linear spacing), we must use the actual log-spacing width
+        // so that slower (wider) timescale bins contribute their proper share.
+        let log_spacing = 5.0 * std::f64::consts::LN_10 / (k - 1) as f64;
+
         for i in 0..k {
             // Log-spaced timescales from 0.001s to 100s
             let b = 0.001 * 10.0f64.powf(i as f64 * 5.0 / (k - 1) as f64);
             betas.push(b);
-            alphas.push(alpha / (k as f64 * (delta + 1.0 / b).powf(beta)));
+            alphas.push(alpha * log_spacing / (delta + 1.0 / b).powf(beta));
         }
 
         Ok(Self {
