@@ -45,6 +45,35 @@ impl HawkesLikelihood {
         // No more bounds check needed as exp() > 0
         Some((mu, alphas))
     }
+
+    /// Shared helper: computes Σ_i [1 - exp(-β_k · (t_max - t_i))] for every kernel k.
+    /// Used identically by both cost() and gradient(), so extracted to avoid the O(N·K)
+    /// parallel sum running twice per L-BFGS iteration.
+    fn compute_integral_sums(&self) -> Vec<f64> {
+        let t_max = self.timestamps.last().copied().unwrap_or(0.0);
+        let k_kernels = self.fixed_betas.len();
+
+        self.timestamps
+            .par_iter()
+            .fold(
+                || vec![0.0; k_kernels],
+                |mut acc, &t| {
+                    for (k, acc_k) in acc.iter_mut().enumerate() {
+                        *acc_k += 1.0 - (-self.fixed_betas[k] * (t_max - t)).exp();
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0; k_kernels],
+                |mut a, b| {
+                    for (a_k, b_k) in a.iter_mut().zip(b.iter()) {
+                        *a_k += b_k;
+                    }
+                    a
+                },
+            )
+    }
 }
 
 impl CostFunction for HawkesLikelihood {
@@ -94,26 +123,7 @@ impl CostFunction for HawkesLikelihood {
         let integral_mu = mu * total_duration;
 
         let term2: f64 = self
-            .timestamps
-            .par_iter()
-            .fold(
-                || vec![0.0; k_kernels],
-                |mut acc, &t| {
-                    for (k, acc_k) in acc.iter_mut().enumerate() {
-                        *acc_k += 1.0 - (-self.fixed_betas[k] * (t_max - t)).exp();
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0; k_kernels],
-                |mut a, b| {
-                    for (a_k, b_k) in a.iter_mut().zip(b.iter()) {
-                        *a_k += *b_k;
-                    }
-                    a
-                },
-            )
+            .compute_integral_sums()
             .iter()
             .zip(alphas.iter().zip(self.fixed_betas.iter()))
             .map(|(sum_exp, (&alpha, &beta))| (alpha / beta) * sum_exp)
@@ -130,16 +140,18 @@ impl Gradient for HawkesLikelihood {
     fn gradient(&self, param: &Self::Param) -> Result<Self::Gradient, Error> {
         let (mu, alphas) = match self.convert_params(param) {
             Some(v) => v,
-            None => return Ok(vec![0.0; param.len()]),
+            // Return an error so L-BFGS gets a real failure signal instead of
+            // a zero gradient (which would look like a stationary point and could
+            // cause the optimizer to terminate early or break the line search).
+            None => {
+                return Err(Error::msg(
+                    "Parameters out of bounds in gradient evaluation",
+                ));
+            }
         };
 
-        // ... Standard gradient calculation w.r.t actual parameters mu, alphas ...
         let n = self.timestamps.len();
         let k_kernels = self.fixed_betas.len();
-
-        // Debug params
-        // println!("Gradient eval at params: {:?}", param);
-        // println!("Gradient eval at actual: mu={}, alphas={:?}", mu, alphas);
 
         let mut grad_mu_term1 = 0.0;
         let mut grad_alpha_term1 = vec![0.0; k_kernels];
@@ -179,27 +191,7 @@ impl Gradient for HawkesLikelihood {
         let grad_integral_mu = total_duration;
         let mut grad_integral_alpha = vec![0.0; k_kernels];
 
-        let term_sums: Vec<f64> = self
-            .timestamps
-            .par_iter()
-            .fold(
-                || vec![0.0; k_kernels],
-                |mut acc, &t| {
-                    for (k, acc_k) in acc.iter_mut().enumerate() {
-                        *acc_k += 1.0 - (-self.fixed_betas[k] * (t_max - t)).exp();
-                    }
-                    acc
-                },
-            )
-            .reduce(
-                || vec![0.0; k_kernels],
-                |mut a, b| {
-                    for (a_k, b_k) in a.iter_mut().zip(b.iter()) {
-                        *a_k += *b_k;
-                    }
-                    a
-                },
-            );
+        let term_sums = self.compute_integral_sums();
 
         for k in 0..k_kernels {
             grad_integral_alpha[k] = term_sums[k] / self.fixed_betas[k];
@@ -225,9 +217,6 @@ impl Gradient for HawkesLikelihood {
         for k in 0..k_kernels {
             grad_log.push(grad_actual[1 + k] * alphas[k]);
         }
-
-        // Debug gradient
-        // println!("Computed Gradient: {:?}", grad_log);
 
         Ok(grad_log)
     }
@@ -255,18 +244,9 @@ pub fn fit_hawkes(
         .configure(|state| state.param(init_param).max_iters(100))
         .run()?;
 
-    // println!("Iterations: {}", res.state.get_iter());
-    // println!("Final Cost: {}", res.state.get_cost());
-    // println!("Termination: {:?}", res.state.get_termination_reason());
-
     // Convert back from log params
     let best_param_log = res.state.best_param.ok_or("No best parameter found")?;
     let (mu, alphas) = cost.convert_params(&best_param_log).unwrap();
-
-    // println!(
-    //    "Fitted Model: {:?}",
-    //    SumExpHawkes::new(mu, alphas.clone(), cost.fixed_betas.clone())?
-    // );
 
     Ok((mu, alphas))
 }
