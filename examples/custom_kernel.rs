@@ -1,4 +1,4 @@
-use hawkes::{HawkesModel, HawkesResult};
+use hawkes::{HawkesError, HawkesModel, HawkesResult};
 
 /// A custom Kernel implementing the HawkesModel trait.
 /// Example: A simple linear decay kernel g(t) = max(0, alpha - beta * t)
@@ -26,22 +26,34 @@ impl LinearDecayHawkes {
 }
 
 impl HawkesModel for LinearDecayHawkes {
-    fn update(&mut self, timestamp_ms: u64, _volume: Option<f64>) -> f64 {
-        let dt = (timestamp_ms - self.last_timestamp) as f64 / 1000.0;
+    fn update(&mut self, timestamp_us: u64, _volume: Option<f64>) -> HawkesResult<f64> {
+        if timestamp_us < self.last_timestamp {
+            return Err(HawkesError::NonMonotonicTimestamp {
+                previous_us: self.last_timestamp,
+                current_us: timestamp_us,
+            });
+        }
+        let dt = (timestamp_us - self.last_timestamp) as f64 / 1_000_000.0;
 
         // Linear decay: x(t) = x(t-1) - beta * dt
         let decayed = (self.current_val - self.beta * dt).max(0.0);
 
         // Jump
         self.current_val = decayed + self.alpha;
-        self.last_timestamp = timestamp_ms;
+        self.last_timestamp = timestamp_us;
 
-        self.current_val
+        Ok(self.current_val)
     }
 
-    fn evaluate(&self, timestamp_ms: u64) -> f64 {
-        let dt = (timestamp_ms - self.last_timestamp) as f64 / 1000.0;
-        (self.current_val - self.beta * dt).max(0.0)
+    fn evaluate(&self, timestamp_us: u64) -> HawkesResult<f64> {
+        if timestamp_us < self.last_timestamp {
+            return Err(HawkesError::NonMonotonicTimestamp {
+                previous_us: self.last_timestamp,
+                current_us: timestamp_us,
+            });
+        }
+        let dt = (timestamp_us - self.last_timestamp) as f64 / 1_000_000.0;
+        Ok((self.current_val - self.beta * dt).max(0.0))
     }
 
     fn current_excitation(&self) -> f64 {
@@ -57,12 +69,12 @@ fn main() -> HawkesResult<()> {
     let mut custom_model = LinearDecayHawkes::new(1.0, 2.0, 0.5);
     println!("Custom Kernel Initialized: {:?}", custom_model);
 
-    custom_model.update(0, None);
+    custom_model.update(0, None)?;
     println!("t=0: Intensity={}", custom_model.intensity());
 
-    custom_model.update(1000, None); // dt=1.0s, decay = 0.5
+    custom_model.update(1_000_000, None)?; // dt=1.0s, decay = 0.5
     println!(
-        "t=1000 (after 1s decay): Intensity={}",
+        "t=1000000us (after 1s decay): Intensity={}",
         custom_model.intensity()
     );
 

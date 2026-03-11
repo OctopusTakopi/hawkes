@@ -17,31 +17,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Initialized Power Law Approximation: {:?}", model);
 
     // Verify update matches evaluate
-    let _e1 = model.update(0, None);
-    let _e2 = model.update(500, None);
+    let _e1 = model.update(0, None)?;
+    let _e2 = model.update(500_000, None)?;
 
     // Predict future intensity
-    let _future_intensity = model.evaluate(1000);
+    let _future_intensity = model.evaluate(1_000_000)?;
     // println!("Intensity at t=1000: {}", future_intensity);
 
     // Verify long-term decay
-    for t in (1000..10000).step_by(1000) {
-        model.evaluate(t);
+    for t in (1_000_000..10_000_000).step_by(1_000_000) {
+        let _ = model.evaluate(t)?;
     }
 
-    let _intensity_at_1000 = model.evaluate(100000);
+    let _intensity_at_1000 = model.evaluate(100_000_000)?;
     // This returns just excitation
     // Accessing mu directly is not exposed on ApproxPowerLawHawkes wrapper by default unless I made it pub.
 
-    // We want intensity at t=1000.
+    // We want intensity at t=1_000_000us.
     // Note: the model's last timestamp is updated by `update`.
-    // So `evaluate(1000)` will calculate decay from last event to 1000.
+    // So `evaluate(1_000_000)` will calculate decay from last event to 1_000_000us.
 
-    // So to get intensity at t=1000:
-    // let intensity_at_1000 = 0.5 + model.evaluate(1000);
+    // So to get intensity at t=1_000_000us:
+    // let intensity_at_1000 = 0.5 + model.evaluate(1_000_000);
     println!(
-        "t=1000ms (eval): Intensity={:.4} (approx)",
-        0.5 + model.evaluate(1000)
+        "t=1000000us (eval): Intensity={:.4} (approx)",
+        0.5 + model.evaluate(1_000_000)?
     );
 
     Ok(())

@@ -10,24 +10,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Initial Intensity: {:.4}", model.intensity());
 
     // 2. Simulate some events
-    // Event at t=0ms with default volume (1.0)
-    let e1 = model.update(0, None);
+    // Event at t=0us with default volume (1.0)
+    let e1 = model.update(0, None)?;
     println!(
-        "t=0ms: Excitation={:.4}, Intensity={:.4}",
+        "t=0us: Excitation={:.4}, Intensity={:.4}",
         e1,
         model.intensity()
     );
 
-    // Check decay at t=100ms without update
+    // Check decay at t=100_000us (0.1s) without update
     println!(
-        "t=100ms (eval): Intensity={:.4}",
-        model.mu + model.evaluate(100)
+        "t=100000us (eval): Intensity={:.4}",
+        model.mu + model.evaluate(100_000)?
     );
 
-    // Event at t=200ms
-    let e2 = model.update(200, None);
+    // Event at t=200_000us
+    let e2 = model.update(200_000, None)?;
     println!(
-        "t=200ms: Excitation={:.4}, Intensity={:.4}",
+        "t=200000us: Excitation={:.4}, Intensity={:.4}",
         e2,
         model.intensity()
     );
