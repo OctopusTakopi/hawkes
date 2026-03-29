@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Deserialize)]
 pub struct BinanceTrade {
     #[serde(rename = "T")]
-    pub trade_time: u64, // Trade timestamp in milliseconds
+    pub trade_time: u64, // Trade timestamp in microseconds
     #[serde(rename = "q")]
     pub quantity: String, // Trade volume as a string
 }
@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let params_path = "data/parameters.json";
-    let file_path = "data/BTCUSDT-aggTrades-2026-02-10.csv";
+    let file_path = "data/BTCUSDT-aggTrades-2026-02-10.zip";
 
     // Define fixed timescales (betas)
     let fixed_betas = vec![10.0, 1.0, 0.1];
@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t_micros: u64 = record[5].parse()?;
             timestamps.push(t_micros as f64 / 1_000_000.0);
         }
+        timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!("Loaded {} events. Starting fitting...", timestamps.len());
 
         let fitted_model = SumExpHawkes::fit(timestamps, fixed_betas.clone())?;
@@ -76,8 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model Ready: {:?}", sum_hawkes);
 
     // 3. Approximate Power Law (Long memory)
-    // Using 5 exponentials to approximate the (delta + t)^-1.5 curve
-    let mut power_hawkes = ApproxPowerLawHawkes::new(1.0, 1.0, 1.5, 0.01, 5)?;
+    // Using 5 exponentials to approximate the (delta + t)^-1.5 curve.
+    // The smaller alpha keeps the approximation stationary under the new invariant.
+    let mut power_hawkes = ApproxPowerLawHawkes::new(1.0, 0.05, 1.5, 0.01, 5)?;
 
     // Open the CSV file
     // Open the CSV file (inside zip)
@@ -96,20 +98,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for result in rdr.records() {
         let record = result?;
-        // CSV Format: [id, price, qty, ..., timestamp_ms, ...]
+        // CSV Format: [id, price, qty, ..., timestamp_us, ...]
         // We verified timestamp is at index 5 (microseconds in the file we looked at earlier?
         // Wait, the head output showed: 3855286221,70138.00000000,0.00186000,5933596729,5933596729,1770681600109055,True,True
         // The offline_fit.py used column 5 and divided by 1,000,000.0, so it treated it as microseconds.
         // Let's use the same logic here.
 
-        let timestamp_micros: u64 = record[5].parse()?;
-        let timestamp_ms = timestamp_micros / 1000;
+        let timestamp_us: u64 = record[5].parse()?;
         let quantity: f64 = record[2].parse()?; // Index 2 is quantity based on head output
 
         // Update models
-        let _e1 = std_hawkes.update(timestamp_ms, Some(quantity));
-        let e2 = sum_hawkes.update(timestamp_ms, Some(quantity));
-        let _e3 = power_hawkes.update(timestamp_ms, Some(quantity));
+        let _e1 = std_hawkes.update(timestamp_us, Some(quantity))?;
+        let e2 = sum_hawkes.update(timestamp_us, Some(quantity))?;
+        let _e3 = power_hawkes.update(timestamp_us, Some(quantity))?;
 
         count += 1;
         if count % 100_000 == 0 {

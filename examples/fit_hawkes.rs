@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let json = serde_json::to_string_pretty(&model)?;
-    let output_path = "data/parameters.json";
+    let output_path = "data/parameters.generated.json";
     std::fs::write(output_path, json)?;
     println!("Fitted parameters saved to {}", output_path);
 

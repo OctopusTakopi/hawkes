@@ -13,12 +13,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Initial Intensity: {:.4}", model.intensity());
 
     // 2. Simulate rapid succession of events
-    let timestamps = vec![0, 10, 20, 50, 100];
+    let timestamps = vec![0, 10_000, 20_000, 50_000, 100_000];
 
     for t in timestamps {
-        let e = model.update(t, None);
+        let e = model.update(t, None)?;
         println!(
-            "t={}ms: Excitation={:.4}, Intensity={:.4}",
+            "t={}us: Excitation={:.4}, Intensity={:.4}",
             t,
             e,
             model.intensity()
