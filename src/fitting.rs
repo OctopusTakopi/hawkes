@@ -101,23 +101,41 @@ fn compute_integral_sums(timestamps: &[f64], fixed_betas: &[f64]) -> Vec<f64> {
 impl HawkesLikelihood {
     /// Computes NegLogLikelihood and Gradient.
     /// Returns (nll, grad)
-    /// Params: [log_mu, log_alpha_0, log_alpha_1, ...]
-    /// Internal parameters are LOG of actual parameters to enforce positivity.
+    /// Params: [log_mu, raw_branch_0, raw_branch_1, ...]
+    /// mu = exp(log_mu)
+    /// alpha_k = beta_k * exp(raw_branch_k) / (1 + Σ_j exp(raw_branch_j))
+    /// This guarantees Σ_k alpha_k / beta_k < 1, so fitted models stay stationary.
     pub fn convert_params(&self, p: &[f64]) -> Option<(f64, Vec<f64>)> {
         if p.len() != 1 + self.fixed_betas.len() {
             return None;
         }
-        // Exponentiate to get actual positive parameters
-        // Guard against overflow: if p > 50.0, exp(p) is huge.
-        // Bounds check: if any param > 50.0, return None (Cost = Inf)
-        if p.iter().any(|&x| x > 50.0) {
+        if p.iter().any(|x| !x.is_finite()) {
             return None;
         }
 
         let mu = p[0].exp();
-        let alphas: Vec<f64> = p[1..].iter().map(|x| x.exp()).collect();
+        if !mu.is_finite() || mu <= 0.0 {
+            return None;
+        }
 
-        // No more bounds check needed as exp() > 0
+        // Compute alpha_k / beta_k using a stable softmax over the branch logits
+        // plus one extra "slack" component of weight 1.0, which keeps the
+        // branching ratio strictly below 1.
+        let max_raw_branch = p[1..].iter().copied().fold(0.0, f64::max);
+        let shifted_partition = (-max_raw_branch).exp()
+            + p[1..]
+                .iter()
+                .map(|&raw| (raw - max_raw_branch).exp())
+                .sum::<f64>();
+        let log_denom = max_raw_branch + shifted_partition.ln();
+
+        let alphas: Vec<f64> = self
+            .fixed_betas
+            .iter()
+            .zip(p[1..].iter())
+            .map(|(&beta, &raw)| beta * (raw - log_denom).exp())
+            .collect();
+
         Some((mu, alphas))
     }
 }
@@ -239,8 +257,8 @@ impl Gradient for HawkesLikelihood {
         let grad_integral_mu = total_duration;
         let mut grad_integral_alpha = vec![0.0; k_kernels];
 
-        for k in 0..k_kernels {
-            grad_integral_alpha[k] = self.integral_sums()[k] / self.fixed_betas[k];
+        for (k, grad) in grad_integral_alpha.iter_mut().enumerate().take(k_kernels) {
+            *grad = self.integral_sums()[k] / self.fixed_betas[k];
         }
 
         // Combine for NegLogLikelihood Gradient w.r.t actual params
@@ -250,18 +268,20 @@ impl Gradient for HawkesLikelihood {
             grad_actual.push(-(grad_alpha_term1[k] - grad_integral_alpha[k]));
         }
 
-        // Apply Chain Rule for Log-Parameters
-        // param = log(p_actual) => p_actual = exp(param)
-        // d(Cost)/d(param) = d(Cost)/d(p_actual) * d(p_actual)/d(param)
-        //                  = grad_actual * exp(param)
-        //                  = grad_actual * p_actual
+        // Apply chain rule for the constrained parameterization.
         let mut grad_log = Vec::with_capacity(param.len());
 
-        // Mu
         grad_log.push(grad_actual[0] * mu);
-        // Alphas
+
+        let weighted_alpha_grad: f64 = grad_actual[1..]
+            .iter()
+            .zip(alphas.iter())
+            .map(|(grad, alpha)| grad * alpha)
+            .sum();
+
         for k in 0..k_kernels {
-            grad_log.push(grad_actual[1 + k] * alphas[k]);
+            grad_log
+                .push(alphas[k] * (grad_actual[1 + k] - weighted_alpha_grad / self.fixed_betas[k]));
         }
 
         Ok(grad_log)
@@ -274,11 +294,14 @@ pub fn fit_hawkes(
 ) -> Result<(f64, Vec<f64>), Box<dyn std::error::Error>> {
     let cost = HawkesLikelihood::new(timestamps, fixed_betas)?;
 
-    // Initial guess: Use LOG parameters.
-    // Try mu=1.0, alpha=0.2*beta
+    // Initial guess:
+    // mu = 1.0
+    // alpha_k / beta_k share is initialized to about 0.2 / K, keeping the
+    // total branching ratio strictly below 1.
     let mut init_param = vec![1.0f64.ln()];
-    for &beta in &cost.fixed_betas {
-        init_param.push((beta * 0.2).ln());
+    let target_branch_component = (0.2 / cost.fixed_betas.len() as f64).ln();
+    for _ in &cost.fixed_betas {
+        init_param.push(target_branch_component);
     }
 
     let linesearch = BacktrackingLineSearch::new(ArmijoCondition::new(0.0001)?);
@@ -321,5 +344,18 @@ mod tests {
         let expected = compute_integral_sums(&likelihood.timestamps, &likelihood.fixed_betas);
 
         assert_eq!(likelihood.integral_sums(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_parameter_conversion_enforces_stationarity() {
+        let likelihood = HawkesLikelihood::new(vec![0.0, 1.0, 3.0], vec![10.0, 1.0, 0.1]).unwrap();
+        let (_mu, alphas) = likelihood.convert_params(&[0.0, 20.0, 20.0, 20.0]).unwrap();
+        let branching_ratio: f64 = alphas
+            .iter()
+            .zip(likelihood.fixed_betas.iter())
+            .map(|(&alpha, &beta)| alpha / beta)
+            .sum();
+
+        assert!(branching_ratio < 1.0);
     }
 }

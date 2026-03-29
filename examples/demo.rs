@@ -77,8 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model Ready: {:?}", sum_hawkes);
 
     // 3. Approximate Power Law (Long memory)
-    // Using 5 exponentials to approximate the (delta + t)^-1.5 curve
-    let mut power_hawkes = ApproxPowerLawHawkes::new(1.0, 1.0, 1.5, 0.01, 5)?;
+    // Using 5 exponentials to approximate the (delta + t)^-1.5 curve.
+    // The smaller alpha keeps the approximation stationary under the new invariant.
+    let mut power_hawkes = ApproxPowerLawHawkes::new(1.0, 0.05, 1.5, 0.01, 5)?;
 
     // Open the CSV file
     // Open the CSV file (inside zip)

@@ -9,7 +9,7 @@
 //! - **Fitting**: Estimating parameters from historical data using Maximum Likelihood Estimation (MLE).
 //! - **Real-time Evaluation**: Efficient $O(1)$ and $O(K)$ updates.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -28,6 +28,14 @@ pub enum HawkesError {
     DimensionMismatch(usize, usize),
     #[error("number of scales k must be at least 2 for log-spacing (got {0})")]
     InvalidLogSpacing(usize),
+    #[error("branching ratio must be strictly less than 1 for stationarity (got {0})")]
+    InvalidBranchingRatio(f64),
+    #[error("event volume must be non-negative (got {0})")]
+    InvalidVolume(f64),
+    #[error("excitation state must be non-negative (got {0})")]
+    InvalidExcitation(f64),
+    #[error("excitations number ({0}) must match kernel count ({1})")]
+    ExcitationDimensionMismatch(usize, usize),
     #[error("timestamp list must contain at least one event")]
     EmptyTimestamps,
     #[error("timestamps must be sorted in nondecreasing order")]
@@ -58,7 +66,7 @@ pub trait HawkesModel {
 
 /// Computes the Hawkes excitation component iteratively in O(1) time.
 /// Uses a single exponential kernel: g(t) = alpha * exp(-beta * t)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct HawkesExcitation {
     pub mu: f64,
     pub alpha: f64,
@@ -77,6 +85,7 @@ impl HawkesExcitation {
         if beta <= 0.0 {
             return Err(HawkesError::InvalidBeta(beta));
         }
+        validate_stationary_branching_ratio(alpha / beta)?;
         Ok(Self {
             mu,
             alpha,
@@ -87,10 +96,7 @@ impl HawkesExcitation {
     }
 
     pub fn update(&mut self, timestamp_us: u64, volume: Option<f64>) -> HawkesResult<f64> {
-        let jump = match volume {
-            Some(v) => self.alpha * v,
-            None => self.alpha,
-        };
+        let jump = self.alpha * validated_volume_factor(volume)?;
 
         if let Some(last_time_us) = self.last_timestamp_us {
             let delta_t = checked_delta_t(last_time_us, timestamp_us)?;
@@ -137,6 +143,10 @@ impl HawkesExcitation {
         // If we want intensity immediately after update:
         self.mu + self.current_excitation
     }
+
+    pub fn branching_ratio(&self) -> f64 {
+        self.alpha / self.beta
+    }
 }
 
 impl HawkesModel for HawkesExcitation {
@@ -159,7 +169,7 @@ impl HawkesModel for HawkesExcitation {
 
 /// Sum of Exponentials Hawkes process: g(t) = sum(alpha_i * exp(-beta_i * t))
 /// Maintains O(K) complexity where K is the number of exponentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SumExpHawkes {
     pub mu: f64,
     pub alphas: Vec<f64>,
@@ -193,6 +203,7 @@ impl SumExpHawkes {
                 return Err(HawkesError::InvalidBeta(beta));
             }
         }
+        validate_stationary_branching_ratio(branching_ratio(&alphas, &betas))?;
         let k = alphas.len();
         Ok(Self {
             mu,
@@ -204,7 +215,7 @@ impl SumExpHawkes {
     }
 
     pub fn update(&mut self, timestamp_us: u64, volume: Option<f64>) -> HawkesResult<f64> {
-        let volume_factor = volume.unwrap_or(1.0);
+        let volume_factor = validated_volume_factor(volume)?;
 
         if let Some(last_time_us) = self.last_timestamp_us {
             let delta_t = checked_delta_t(last_time_us, timestamp_us)?;
@@ -272,6 +283,10 @@ impl SumExpHawkes {
     pub fn intensity(&self) -> f64 {
         self.mu + self.current_excitation()
     }
+
+    pub fn branching_ratio(&self) -> f64 {
+        branching_ratio(&self.alphas, &self.betas)
+    }
 }
 
 impl HawkesModel for SumExpHawkes {
@@ -294,7 +309,7 @@ impl HawkesModel for SumExpHawkes {
 
 /// Approximate Power Law Hawkes process using a log-spaced sum of exponentials.
 /// Power Law Kernel: g(t) = alpha / (delta + t)^beta
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ApproxPowerLawHawkes {
     inner: SumExpHawkes,
 }
@@ -378,6 +393,10 @@ impl ApproxPowerLawHawkes {
     pub fn intensity(&self) -> f64 {
         self.inner.intensity()
     }
+
+    pub fn branching_ratio(&self) -> f64 {
+        self.inner.branching_ratio()
+    }
 }
 
 fn validate_nonnegative_finite(name: &'static str, value: f64) -> HawkesResult<()> {
@@ -388,6 +407,8 @@ fn validate_nonnegative_finite(name: &'static str, value: f64) -> HawkesResult<(
         return Err(match name {
             "mu" => HawkesError::InvalidMu(value),
             "alpha" => HawkesError::InvalidAlpha(value),
+            "volume" => HawkesError::InvalidVolume(value),
+            "excitation" => HawkesError::InvalidExcitation(value),
             _ => HawkesError::NonFiniteParameter(name, value),
         });
     }
@@ -402,6 +423,106 @@ fn checked_delta_t(last_timestamp_us: u64, timestamp_us: u64) -> HawkesResult<f6
         });
     }
     Ok((timestamp_us - last_timestamp_us) as f64 / 1_000_000.0)
+}
+
+fn branching_ratio(alphas: &[f64], betas: &[f64]) -> f64 {
+    alphas
+        .iter()
+        .zip(betas.iter())
+        .map(|(&alpha, &beta)| alpha / beta)
+        .sum()
+}
+
+fn validate_stationary_branching_ratio(value: f64) -> HawkesResult<()> {
+    if value >= 1.0 {
+        return Err(HawkesError::InvalidBranchingRatio(value));
+    }
+    Ok(())
+}
+
+fn validated_volume_factor(volume: Option<f64>) -> HawkesResult<f64> {
+    let value = volume.unwrap_or(1.0);
+    validate_nonnegative_finite("volume", value)?;
+    Ok(value)
+}
+
+impl<'de> Deserialize<'de> for HawkesExcitation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct HawkesExcitationHelper {
+            mu: f64,
+            alpha: f64,
+            beta: f64,
+            current_excitation: f64,
+            last_timestamp_us: Option<u64>,
+        }
+
+        let helper = HawkesExcitationHelper::deserialize(deserializer)?;
+        let mut model = HawkesExcitation::new(helper.mu, helper.alpha, helper.beta)
+            .map_err(serde::de::Error::custom)?;
+        validate_nonnegative_finite("excitation", helper.current_excitation)
+            .map_err(serde::de::Error::custom)?;
+        model.current_excitation = helper.current_excitation;
+        model.last_timestamp_us = helper.last_timestamp_us;
+        Ok(model)
+    }
+}
+
+impl<'de> Deserialize<'de> for SumExpHawkes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SumExpHawkesHelper {
+            mu: f64,
+            alphas: Vec<f64>,
+            betas: Vec<f64>,
+            excitations: Vec<f64>,
+            last_timestamp_us: Option<u64>,
+        }
+
+        let helper = SumExpHawkesHelper::deserialize(deserializer)?;
+        if helper.excitations.len() != helper.alphas.len() {
+            return Err(serde::de::Error::custom(
+                HawkesError::ExcitationDimensionMismatch(
+                    helper.excitations.len(),
+                    helper.alphas.len(),
+                ),
+            ));
+        }
+
+        for &excitation in &helper.excitations {
+            validate_nonnegative_finite("excitation", excitation)
+                .map_err(serde::de::Error::custom)?;
+        }
+
+        let mut model = SumExpHawkes::new(helper.mu, helper.alphas, helper.betas)
+            .map_err(serde::de::Error::custom)?;
+        model.excitations = helper.excitations;
+        model.last_timestamp_us = helper.last_timestamp_us;
+        Ok(model)
+    }
+}
+
+impl<'de> Deserialize<'de> for ApproxPowerLawHawkes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct ApproxPowerLawHawkesHelper {
+            inner: SumExpHawkes,
+        }
+
+        let helper = ApproxPowerLawHawkesHelper::deserialize(deserializer)?;
+        Ok(Self {
+            inner: helper.inner,
+        })
+    }
 }
 
 impl HawkesModel for ApproxPowerLawHawkes {
@@ -428,25 +549,25 @@ mod tests {
 
     #[test]
     fn test_evaluate_vs_update() {
-        let mut hawkes = HawkesExcitation::new(0.5, 1.0, 1.0).unwrap();
+        let mut hawkes = HawkesExcitation::new(0.5, 0.8, 1.0).unwrap();
 
         hawkes.update(0, None).unwrap();
-        assert_eq!(hawkes.current_excitation(), 1.0);
-        assert_eq!(hawkes.intensity(), 1.5); // mu + excitation
+        assert_eq!(hawkes.current_excitation(), 0.8);
+        assert_eq!(hawkes.intensity(), 1.3); // mu + excitation
 
         let eval_val = hawkes.evaluate(1_000_000).unwrap();
-        assert!((eval_val - 0.3678).abs() < 0.01);
+        assert!((eval_val - 0.2943).abs() < 0.01);
 
-        assert_eq!(hawkes.current_excitation(), 1.0);
+        assert_eq!(hawkes.current_excitation(), 0.8);
 
         hawkes.update(1_000_000, None).unwrap();
         let cur = hawkes.current_excitation();
-        assert!((cur - 1.3678).abs() < 0.01);
+        assert!((cur - 1.0943).abs() < 0.01);
     }
 
     #[test]
     fn test_serialization() {
-        let mut hawkes = HawkesExcitation::new(0.5, 1.0, 1.0).unwrap();
+        let mut hawkes = HawkesExcitation::new(0.5, 0.8, 1.0).unwrap();
         hawkes.update(0, None).unwrap();
 
         // Serialize
@@ -481,11 +602,53 @@ mod tests {
             ApproxPowerLawHawkes::new(0.1, 1.0, 1.0, 0.0, 5),
             Err(HawkesError::InvalidDelta(_))
         ));
+        assert!(matches!(
+            HawkesExcitation::new(0.1, 1.0, 1.0),
+            Err(HawkesError::InvalidBranchingRatio(_))
+        ));
+        assert!(matches!(
+            SumExpHawkes::new(0.1, vec![0.6, 0.5], vec![1.0, 1.0]),
+            Err(HawkesError::InvalidBranchingRatio(_))
+        ));
+    }
+
+    #[test]
+    fn test_rejects_invalid_volume_inputs() {
+        let mut single = HawkesExcitation::new(0.5, 0.8, 1.0).unwrap();
+        assert!(matches!(
+            single.update(0, Some(-1.0)),
+            Err(HawkesError::InvalidVolume(_))
+        ));
+        assert!(matches!(
+            single.update(0, Some(f64::NAN)),
+            Err(HawkesError::NonFiniteParameter("volume", _))
+        ));
+
+        let mut multi = SumExpHawkes::new(0.1, vec![0.2, 0.1], vec![1.0, 2.0]).unwrap();
+        assert!(matches!(
+            multi.update(0, Some(-1.0)),
+            Err(HawkesError::InvalidVolume(_))
+        ));
+    }
+
+    #[test]
+    fn test_deserialization_validates_state() {
+        let unstable = r#"{"mu":0.5,"alpha":1.0,"beta":1.0,"current_excitation":0.0,"last_timestamp_us":null}"#;
+        assert!(serde_json::from_str::<HawkesExcitation>(unstable).is_err());
+
+        let mismatched = r#"{
+            "mu":0.5,
+            "alphas":[0.2,0.1],
+            "betas":[1.0,2.0],
+            "excitations":[0.1],
+            "last_timestamp_us":null
+        }"#;
+        assert!(serde_json::from_str::<SumExpHawkes>(mismatched).is_err());
     }
 
     #[test]
     fn test_rejects_out_of_order_online_timestamps() {
-        let mut hawkes = HawkesExcitation::new(0.5, 1.0, 1.0).unwrap();
+        let mut hawkes = HawkesExcitation::new(0.5, 0.8, 1.0).unwrap();
         hawkes.update(1_000_000, None).unwrap();
 
         assert!(matches!(

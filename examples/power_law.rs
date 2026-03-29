@@ -5,16 +5,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     // 1. Initialize Approximate Power Law Model
     // Fits a power law kernel g(t) = alpha / (delta + t)^beta using a sum of exponentials
     // Mu = 0.5
-    // Alpha = 1.0 (scale)
+    // Alpha = 0.05 (scale chosen so the sum-exp approximation stays stationary)
     // Beta = 1.5 (power law exponent, typically > 1)
     // Delta = 0.01 (shift to avoid singularity at t=0)
     // K = 5 (number of exponential kernels to use for approximation)
-    let mut model = ApproxPowerLawHawkes::new(0.5, 1.0, 1.5, 0.01, 5)?;
+    let mut model = ApproxPowerLawHawkes::new(0.5, 0.05, 1.5, 0.01, 5)?;
 
     // Alternatively, perform the approximation manually if you want to inspect scales
     // let manual_model = ApproxPowerLawHawkes::with_scales(...);
 
-    println!("Initialized Power Law Approximation: {:?}", model);
+    println!(
+        "Initialized Power Law Approximation: {:?} (branching ratio {:.4})",
+        model,
+        model.branching_ratio()
+    );
 
     // Verify update matches evaluate
     let _e1 = model.update(0, None)?;
