@@ -1,3 +1,5 @@
+//! Minimal online example for a single exponential kernel.
+
 use hawkes::HawkesExcitation;
 use std::error::Error;
 
@@ -21,7 +23,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Check decay at t=100_000us (0.1s) without update
     println!(
         "t=100000us (eval): Intensity={:.4}",
-        model.mu + model.evaluate(100_000)?
+        model.mu() + model.evaluate(100_000)?
     );
 
     // Event at t=200_000us

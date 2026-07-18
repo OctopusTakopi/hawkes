@@ -1,3 +1,5 @@
+//! Online example for a sum of exponential kernels.
+
 use hawkes::SumExpHawkes;
 use std::error::Error;
 
