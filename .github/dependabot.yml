@@ -5,9 +5,20 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    ignore:
+      # This action tag is the minimum supported Rust version, not an action release.
+      - dependency-name: dtolnay/rust-toolchain
