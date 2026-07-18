@@ -97,6 +97,13 @@ fn validate_fit_inputs(
     if timestamps.windows(2).any(|w| w[1] < w[0]) {
         return Err(HawkesError::UnsortedTimestamps);
     }
+    if let Some(timestamp) = timestamps
+        .windows(2)
+        .find(|window| window[1] == window[0])
+        .map(|window| window[0])
+    {
+        return Err(HawkesError::DuplicateTimestamp(timestamp));
+    }
 
     let duration = timestamps[timestamps.len() - 1] - timestamps[0];
     if !duration.is_finite() || duration <= 0.0 {
@@ -484,6 +491,51 @@ fn fit_likelihood(cost: HawkesLikelihood) -> HawkesResult<(f64, Vec<f64>)> {
 mod tests {
     use super::*;
 
+    fn next_uniform(state: &mut u64) -> f64 {
+        let mut value = *state;
+        value ^= value >> 12;
+        value ^= value << 25;
+        value ^= value >> 27;
+        *state = value;
+        let output = value.wrapping_mul(2_685_821_657_736_338_717);
+        ((output >> 11) as f64 + 0.5) / 9_007_199_254_740_992.0
+    }
+
+    /// Simulates one exponential Hawkes process by Ogata thinning.
+    fn simulate_exponential_hawkes(
+        mu: f64,
+        alpha: f64,
+        beta: f64,
+        horizon: f64,
+        seed: u64,
+    ) -> Vec<f64> {
+        let mut state = seed;
+        let mut timestamp = 0.0;
+        let mut excitation = 0.0;
+        let mut timestamps = Vec::new();
+
+        while timestamp < horizon {
+            let upper_intensity = mu + excitation;
+            let wait = -next_uniform(&mut state).ln() / upper_intensity;
+            let candidate = timestamp + wait;
+            if candidate > horizon {
+                break;
+            }
+
+            let candidate_excitation = excitation * (-beta * wait).exp();
+            let candidate_intensity = mu + candidate_excitation;
+            timestamp = candidate;
+            excitation = candidate_excitation;
+
+            if next_uniform(&mut state) * upper_intensity <= candidate_intensity {
+                timestamps.push(timestamp);
+                excitation += alpha;
+            }
+        }
+
+        timestamps
+    }
+
     #[test]
     fn test_fit_rejects_empty_timestamps() {
         let err = HawkesLikelihood::new(vec![], vec![1.0]).err().unwrap();
@@ -499,13 +551,17 @@ mod tests {
     }
 
     #[test]
+    fn test_fit_rejects_duplicate_timestamps() {
+        let err = HawkesLikelihood::new(vec![0.0, 0.0, 1.0], vec![1.0])
+            .err()
+            .unwrap();
+        assert_eq!(err, HawkesError::DuplicateTimestamp(0.0));
+    }
+
+    #[test]
     fn test_fit_requires_positive_observation_window() {
         assert!(matches!(
             HawkesLikelihood::new(vec![1.0], vec![1.0]),
-            Err(HawkesError::InvalidObservationWindow)
-        ));
-        assert!(matches!(
-            HawkesLikelihood::new(vec![1.0, 1.0], vec![1.0]),
             Err(HawkesError::InvalidObservationWindow)
         ));
     }
@@ -654,6 +710,21 @@ mod tests {
         let expected = 4.0 - 2.0 * 2.0_f64.ln();
 
         assert!((cost - expected).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn test_fit_recovers_simulated_parameters() {
+        let true_mu = 0.6;
+        let true_alpha = 0.3;
+        let beta = 1.2;
+        let timestamps =
+            simulate_exponential_hawkes(true_mu, true_alpha, beta, 20_000.0, 0x6a09_e667_f3bc_c909);
+        assert!(timestamps.len() > 10_000);
+
+        let model = crate::SumExpHawkes::fit(timestamps, vec![beta]).unwrap();
+
+        assert!((model.mu() - true_mu).abs() < 0.05);
+        assert!((model.alphas()[0] - true_alpha).abs() < 0.05);
     }
 
     #[test]

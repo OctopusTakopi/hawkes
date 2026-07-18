@@ -5,7 +5,7 @@ use std::error::Error;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mu = 0.5;
-    let alpha = 0.05;
+    let alpha = 0.04;
     let exponent = 1.5;
     let delta = 0.01;
     let mut model = ApproxPowerLawHawkes::new(mu, alpha, exponent, delta, 100)?;

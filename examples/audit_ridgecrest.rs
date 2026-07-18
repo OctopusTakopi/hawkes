@@ -1,4 +1,6 @@
 //! Reproducible chronological audit on the 2019 Ridgecrest earthquake sequence.
+//!
+//! Exact duplicate catalog timestamps are deduplicated before fitting and scoring.
 
 use hawkes::diagnostics::{score_hawkes, score_poisson};
 use hawkes::{Baseline, SumExpHawkes};
@@ -17,15 +19,19 @@ struct Event {
     seconds_since_2019_07_04_utc: f64,
 }
 
-fn load_timestamps() -> Result<Vec<f64>, csv::Error> {
-    csv::Reader::from_reader(DATA)
+fn load_timestamps() -> Result<(Vec<f64>, usize), csv::Error> {
+    let mut timestamps = csv::Reader::from_reader(DATA)
         .deserialize::<Event>()
         .map(|event| event.map(|event| event.seconds_since_2019_07_04_utc))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let catalog_events = timestamps.len();
+    timestamps.dedup();
+    Ok((timestamps, catalog_events))
 }
 
 struct AuditResult {
     model: SumExpHawkes,
+    catalog_events: usize,
     total_events: usize,
     train_events: usize,
     test_events: usize,
@@ -44,7 +50,7 @@ struct AuditResult {
 }
 
 fn run_audit() -> Result<AuditResult, Box<dyn Error>> {
-    let timestamps = load_timestamps()?;
+    let (timestamps, catalog_events) = load_timestamps()?;
     let split_index = timestamps.len() * 4 / 5;
     let origin = timestamps[0];
     let relative_timestamps = timestamps
@@ -82,6 +88,7 @@ fn run_audit() -> Result<AuditResult, Box<dyn Error>> {
 
     Ok(AuditResult {
         model,
+        catalog_events,
         total_events: relative_timestamps.len(),
         train_events: split_index,
         test_events,
@@ -106,8 +113,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("Ridgecrest 2019 temporal holdout audit");
     println!(
-        "events: {} total, {} train / {} test; window: {:.2} days",
-        audit.total_events, audit.train_events, audit.test_events, audit.window_days
+        "events: {} catalog, {} timestamp batches; {} train / {} test; window: {:.2} days",
+        audit.catalog_events,
+        audit.total_events,
+        audit.train_events,
+        audit.test_events,
+        audit.window_days
     );
     println!("fit time: {:.3?}", audit.fit_elapsed);
     println!(
@@ -149,7 +160,8 @@ mod tests {
     fn ridgecrest_fit_is_stationary_and_beats_poisson_holdout() {
         let audit = run_audit().unwrap();
 
-        assert_eq!(audit.total_events, 2_062);
+        assert_eq!(audit.catalog_events, 2_062);
+        assert_eq!(audit.total_events, 2_061);
         assert!(audit.model.branching_ratio() < 1.0);
         assert!(audit.hawkes_log_likelihood.is_finite());
         assert!(audit.lift_per_event > 0.0);

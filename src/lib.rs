@@ -55,6 +55,9 @@ pub enum HawkesError {
     /// The shifted power-law offset was not positive and finite.
     #[error("power-law shift delta must be positive and finite (got {0})")]
     InvalidDelta(f64),
+    /// A generated power-law kernel was not integrable.
+    #[error("power-law exponent beta must be greater than 1 for stationarity (got {0})")]
+    InvalidPowerLawExponent(f64),
     /// Alpha and beta vectors had different lengths.
     #[error("alphas number ({0}) and betas number ({1}) must be equal")]
     DimensionMismatch(usize, usize),
@@ -88,6 +91,11 @@ pub enum HawkesError {
     /// Offline fitting timestamps were not sorted.
     #[error("timestamps must be sorted in nondecreasing order")]
     UnsortedTimestamps,
+    /// An API received successive events or timestamp batches at one time.
+    #[error(
+        "successive event timestamps or timestamp batches must be strictly increasing (duplicate {0})"
+    )]
+    DuplicateTimestamp(f64),
     /// Fitting timestamps did not span a positive finite interval.
     #[error("fitting observation window must have positive finite duration")]
     InvalidObservationWindow,
@@ -198,6 +206,7 @@ mod fitting;
 /// This allows for interchangeable use of different kernels (Exponential, SumExp, PowerLaw).
 pub trait HawkesModel {
     /// Updates the state with a new event and returns the new excitation level.
+    /// Univariate event timestamps must be strictly increasing.
     /// Volumes must have the expectation configured when the model was constructed.
     fn update(&mut self, timestamp_us: u64, volume: Option<f64>) -> HawkesResult<f64>;
     /// Returns the theoretical excitation at `timestamp_us` without updating state.
@@ -258,6 +267,7 @@ impl HawkesExcitation {
         let jump = self.alpha * validated_volume_factor(volume)?;
 
         let next_excitation = if let Some(last_time_us) = self.last_timestamp_us {
+            reject_duplicate_online_timestamp(last_time_us, timestamp_us)?;
             let delta_t = checked_delta_t(last_time_us, timestamp_us)?;
             self.current_excitation * (-self.beta * delta_t).exp() + jump
         } else {
@@ -358,8 +368,10 @@ pub struct SumExpHawkes {
 impl SumExpHawkes {
     /// Fits `mu` and `alpha_k` by maximum likelihood for an unmarked process.
     ///
-    /// Timestamps must be sorted seconds and span a positive interval. `fixed_betas`
-    /// are positive decay rates in inverse seconds and are not optimized.
+    /// Timestamps must be strictly increasing seconds and span a positive interval.
+    /// `fixed_betas` are positive decay rates in inverse seconds and are not optimized.
+    /// The likelihood conditions on the first event and uses the last event as the
+    /// observation-window endpoint.
     pub fn fit(timestamps: Vec<f64>, fixed_betas: Vec<f64>) -> HawkesResult<Self> {
         let (mu, alphas) = fitting::fit_hawkes(timestamps, fixed_betas.clone())?;
         Self::new(mu, alphas, fixed_betas)
@@ -367,7 +379,7 @@ impl SumExpHawkes {
 
     /// Fits a marked Hawkes model conditional on observed non-negative volumes.
     ///
-    /// Timestamps must be sorted seconds and have one corresponding volume each.
+    /// Timestamps must be strictly increasing seconds and have one corresponding volume each.
     /// `expected_volume` is the population expectation used in the stationarity
     /// condition. For marks normalized on training data, pass `1.0`. The mark
     /// density itself is not modeled.
@@ -486,6 +498,7 @@ impl SumExpHawkes {
         let volume_factor = validated_volume_factor(volume)?;
 
         let next_total = if let Some(last_time_us) = self.last_timestamp_us {
+            reject_duplicate_online_timestamp(last_time_us, timestamp_us)?;
             let delta_t = checked_delta_t(last_time_us, timestamp_us)?;
             self.next_excitations
                 .iter_mut()
@@ -637,8 +650,12 @@ impl HawkesModel for SumExpHawkes {
     }
 }
 
-/// Approximate Power Law Hawkes process using a log-spaced sum of exponentials.
-/// Power Law Kernel: g(t) = alpha / (delta + t)^beta
+/// Approximate Power Law Hawkes process using a truncated log-spaced sum of exponentials.
+///
+/// Power Law Kernel: `g(t) = alpha / (delta + t)^beta`. Generated approximations
+/// require `beta > 1` and validate stationarity of both the true kernel and the
+/// exponential approximation. Accuracy is application-dependent outside the
+/// represented 1 ms to 100 s time scales.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApproxPowerLawHawkes {
     inner: SumExpHawkes,
@@ -675,6 +692,15 @@ impl ApproxPowerLawHawkes {
         if k < 2 {
             return Err(HawkesError::InvalidLogSpacing(k));
         }
+        if beta <= 1.0 {
+            return Err(HawkesError::InvalidPowerLawExponent(beta));
+        }
+        validate_stationary_branching_ratio(power_law_branching_ratio(
+            expected_volume,
+            alpha,
+            beta,
+            delta,
+        ))?;
 
         let mut alphas = Vec::with_capacity(k);
         let mut betas = Vec::with_capacity(k);
@@ -802,6 +828,18 @@ fn checked_delta_t(last_timestamp_us: u64, timestamp_us: u64) -> HawkesResult<f6
     Ok((timestamp_us - last_timestamp_us) as f64 / 1_000_000.0)
 }
 
+fn reject_duplicate_online_timestamp(
+    last_timestamp_us: u64,
+    timestamp_us: u64,
+) -> HawkesResult<()> {
+    if timestamp_us == last_timestamp_us {
+        return Err(HawkesError::DuplicateTimestamp(
+            timestamp_us as f64 / 1_000_000.0,
+        ));
+    }
+    Ok(())
+}
+
 fn marked_branching_ratio(expected_volume: f64, alphas: &[f64], betas: &[f64]) -> f64 {
     alphas
         .iter()
@@ -821,6 +859,13 @@ fn scaled_branching_term(expected_volume: f64, alpha: f64, beta: f64) -> f64 {
     } else {
         (expected_volume.ln() + alpha.ln() - beta.ln()).exp()
     }
+}
+
+fn power_law_branching_ratio(expected_volume: f64, alpha: f64, beta: f64, delta: f64) -> f64 {
+    if expected_volume == 0.0 || alpha == 0.0 {
+        return 0.0;
+    }
+    (expected_volume.ln() + alpha.ln() + (1.0 - beta) * delta.ln() - (beta - 1.0).ln()).exp()
 }
 
 fn ln_gamma_positive(value: f64) -> f64 {
@@ -1186,11 +1231,31 @@ mod tests {
 
     #[test]
     fn test_power_law_quadrature_matches_kernel_at_origin() {
-        let mut model = ApproxPowerLawHawkes::new(0.1, 0.05, 1.5, 0.01, 100).unwrap();
+        let mut model = ApproxPowerLawHawkes::new(0.1, 0.04, 1.5, 0.01, 100).unwrap();
         let approximated = model.update(0, None).unwrap();
-        let expected = 0.05 / 0.01f64.powf(1.5);
+        let expected = 0.04 / 0.01f64.powf(1.5);
 
         assert!((approximated - expected).abs() / expected < 5.0e-4);
+    }
+
+    #[test]
+    fn test_power_law_rejects_nonintegrable_exponent() {
+        assert!(matches!(
+            ApproxPowerLawHawkes::new(0.1, 0.05, 1.0, 0.01, 100),
+            Err(HawkesError::InvalidPowerLawExponent(1.0))
+        ));
+        assert!(matches!(
+            ApproxPowerLawHawkes::new(0.1, 0.05, 0.8, 0.01, 100),
+            Err(HawkesError::InvalidPowerLawExponent(0.8))
+        ));
+    }
+
+    #[test]
+    fn test_power_law_validates_true_kernel_stationarity() {
+        assert!(matches!(
+            ApproxPowerLawHawkes::new(0.1, 0.11, 1.1, 1.0, 100),
+            Err(HawkesError::InvalidBranchingRatio(ratio)) if (ratio - 1.1).abs() < 1.0e-12
+        ));
     }
 
     #[test]
@@ -1261,5 +1326,27 @@ mod tests {
                 current_us: 999_999
             })
         ));
+    }
+
+    #[test]
+    fn test_rejects_duplicate_online_timestamps_without_mutation() {
+        let mut single = HawkesExcitation::new(0.5, 0.8, 1.0).unwrap();
+        single.update(1_000_000, None).unwrap();
+        let single_excitation = single.current_excitation();
+        assert_eq!(
+            single.update(1_000_000, None).unwrap_err(),
+            HawkesError::DuplicateTimestamp(1.0)
+        );
+        assert_eq!(single.current_excitation(), single_excitation);
+        assert_eq!(single.evaluate(1_000_000).unwrap(), single_excitation);
+
+        let mut sum = SumExpHawkes::new(0.5, vec![0.2, 0.1], vec![1.0, 2.0]).unwrap();
+        sum.update(1_000_000, None).unwrap();
+        let sum_excitations = sum.excitations().to_vec();
+        assert_eq!(
+            sum.update(1_000_000, None).unwrap_err(),
+            HawkesError::DuplicateTimestamp(1.0)
+        );
+        assert_eq!(sum.excitations(), sum_excitations);
     }
 }

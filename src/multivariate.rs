@@ -340,7 +340,8 @@ impl MultivariateSumExpHawkes {
     /// Applies simultaneous events and returns intensities immediately afterward.
     ///
     /// A component may occur at most once in a batch; aggregate duplicate
-    /// component records before calling this method.
+    /// component records before calling this method. Each call must be strictly
+    /// later than the previous call; include all simultaneous events in one batch.
     pub fn update_batch(
         &mut self,
         timestamp_us: u64,
@@ -360,6 +361,11 @@ impl MultivariateSumExpHawkes {
         }
 
         if let Some(previous) = self.last_timestamp_us {
+            if timestamp_us == previous {
+                return Err(HawkesError::DuplicateTimestamp(
+                    timestamp_us as f64 / 1_000_000.0,
+                ));
+            }
             if timestamp_us < previous {
                 return Err(HawkesError::NonMonotonicTimestamp {
                     previous_us: previous,
@@ -979,6 +985,29 @@ mod tests {
 
         let valid = [ComponentMark::new(0, 1.0).unwrap()];
         assert!(model.update_batch(1_000, &valid).is_ok());
+    }
+
+    #[test]
+    fn online_batch_rejects_successive_batches_at_one_timestamp() {
+        let mut model = MultivariateSumExpHawkes::new(
+            vec![1.0, 1.0],
+            vec![0.2, 0.1, 0.1, 0.2],
+            vec![1.0],
+            vec![1.0, 1.0],
+        )
+        .unwrap();
+        model
+            .update_batch(1_000, &[ComponentMark::new(0, 1.0).unwrap()])
+            .unwrap();
+        let excitations = model.excitations.clone();
+
+        assert_eq!(
+            model
+                .update_batch(1_000, &[ComponentMark::new(1, 1.0).unwrap()])
+                .unwrap_err(),
+            HawkesError::DuplicateTimestamp(0.001)
+        );
+        assert_eq!(model.excitations, excitations);
     }
 
     #[test]

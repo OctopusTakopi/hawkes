@@ -181,11 +181,22 @@ why time-rescaling calibration must be checked.
   source-column constraint is more conservative than unconstrained spectral-radius fitting.
 - Marks must be non-negative. Their distribution is treated as exogenous; the
   likelihood is conditional on observed marks.
-- Online timestamps must be nondecreasing. Exact ties are accepted by the API,
-  but applications modeling a simple point process should aggregate tied events.
-- Fitting conditions on the first observed event and assumes sorted timestamps.
+- Univariate fitting, scoring, and online updates require strictly increasing
+  timestamps. Aggregate tied observations before passing them to the API.
+- Successive multivariate online batches must also have strictly increasing
+  timestamps; include all simultaneous component events in one batch.
+- Fitting conditions on the first observed event and ends the observation window
+  at the last event; there is currently no separate exogenous horizon parameter.
 - The approximate power-law model uses a finite range of exponential scales and
-  is an approximation, not an exact power-law state representation.
+  is an approximation, not an exact power-law state representation. Generated
+  approximations require `beta > 1` and validate stationarity of both the true
+  kernel and its approximation; approximation accuracy should still be validated
+  for the application's time range.
+- `PeriodicShape::fit` is a marginal two-stage estimator, not a joint seasonal
+  Hawkes MLE, so offspring clustering can leak into the fitted seasonal profile.
+- The reported `1.36 / sqrt(n)` KS threshold assumes a fully specified null and
+  is not calibrated for parameters estimated on the same scored events. Prefer
+  holdout diagnostics.
 
 ## Quality and compatibility
 

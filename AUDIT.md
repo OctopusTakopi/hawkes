@@ -2,10 +2,11 @@
 
 ## 2019 Ridgecrest earthquake sequence
 
-This audit uses 2,062 magnitude 2.5+ events from the frozen USGS Ridgecrest
-catalog in `data/ridgecrest_2019_m2_5.csv`. The split is chronological: the
-first 80% of events are used for fitting and the remaining 20% for conditional
-one-step-ahead scoring. No holdout events are used to estimate parameters.
+This audit uses 2,062 magnitude 2.5+ records from the frozen USGS Ridgecrest
+catalog in `data/ridgecrest_2019_m2_5.csv`. One exact timestamp tie is deduplicated,
+leaving 2,061 timestamp batches. The split is chronological: the first 80% of
+batches are used for fitting and the remaining 20% for conditional one-step-ahead
+scoring. No holdout events are used to estimate parameters.
 
 Run the reproducible audit with:
 
@@ -15,7 +16,7 @@ cargo run --release --example audit_ridgecrest
 
 ## Setup
 
-- Train/test events: 1,649 / 413
+- Train/test timestamp batches: 1,648 / 413
 - Total observation window: 7.28 days
 - Fixed exponential decay scales: 5 minutes, 1 hour, and 1 day
 - Baseline: homogeneous Poisson rate estimated on the training window
@@ -26,8 +27,8 @@ cargo run --release --example audit_ridgecrest
 
 | Metric | Hawkes | Poisson / target |
 |---|---:|---:|
-| Holdout log-likelihood | -3926.629 | -4644.705 |
-| Predictive lift | +1.738683 nats/event | 0 |
+| Holdout log-likelihood | -3926.629 | -4643.391 |
+| Predictive lift | +1.735502 nats/event | 0 |
 | Branching ratio | 0.99999999 | strictly below 1 |
 | Mean rescaled increment | 0.997281 | 1.0 |
 | Uniform KS statistic | 0.233584 | 0.066921 at 5% |

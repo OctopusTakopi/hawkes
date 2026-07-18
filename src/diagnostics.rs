@@ -434,6 +434,9 @@ impl TimeRescalingReport {
     }
 
     /// Approximate two-sided 5% KS critical value, `1.36 / sqrt(n)`.
+    ///
+    /// This assumes a fully specified null. It is not calibrated when model
+    /// parameters are estimated from the same events being diagnosed.
     pub fn ks_critical_value_5pct(&self) -> f64 {
         self.ks_critical_value_5pct
     }
@@ -521,6 +524,7 @@ impl ConditionalScore {
 /// `evaluation_start` is the index of the first event to score. Events before
 /// it initialize the excitation recursion without contributing to the reported
 /// likelihood. At least one earlier event is required as conditioning history.
+/// Timestamps must be strictly increasing; aggregate tied observations first.
 pub fn score_hawkes(
     model: &SumExpHawkes,
     timestamps: &[f64],
@@ -810,6 +814,13 @@ fn validate_timestamps_and_start(timestamps: &[f64], evaluation_start: usize) ->
     if timestamps.windows(2).any(|window| window[1] < window[0]) {
         return Err(HawkesError::UnsortedTimestamps);
     }
+    if let Some(timestamp) = timestamps
+        .windows(2)
+        .find(|window| window[1] == window[0])
+        .map(|window| window[0])
+    {
+        return Err(HawkesError::DuplicateTimestamp(timestamp));
+    }
     Ok(())
 }
 
@@ -890,6 +901,22 @@ mod tests {
         let integral = 1.0 + 0.2 * (decay + 1.0) * (1.0 - decay);
 
         assert!((score.log_likelihood() - (intensity.ln() - integral)).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn univariate_scores_reject_duplicate_timestamps() {
+        let model = SumExpHawkes::new(1.0, vec![0.2], vec![1.0]).unwrap();
+        let baseline = Baseline::constant(1.0).unwrap();
+        let timestamps = [0.0, 1.0, 1.0, 2.0];
+
+        assert_eq!(
+            score_hawkes(&model, &timestamps, &[1.0; 4], 1).unwrap_err(),
+            HawkesError::DuplicateTimestamp(1.0)
+        );
+        assert_eq!(
+            score_poisson(&baseline, &timestamps, 1).unwrap_err(),
+            HawkesError::DuplicateTimestamp(1.0)
+        );
     }
 
     #[test]

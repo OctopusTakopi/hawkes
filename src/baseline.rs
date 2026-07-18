@@ -42,11 +42,13 @@ impl PeriodicShape {
         })
     }
 
-    /// Estimates a periodic shape from a sorted training window.
+    /// Estimates a periodic shape from a strictly increasing training window.
     ///
     /// The first event is treated as conditioning history. Each bin rate is
     /// shrunk toward the global training rate using `smoothing_seconds` of
     /// pseudo-exposure, then the resulting shape is normalized to mean one.
+    /// This is a marginal two-stage estimator: Hawkes offspring are counted as
+    /// baseline events and can leak excitation clustering into the fitted shape.
     pub fn fit(
         timestamps: &[f64],
         period: f64,
@@ -250,6 +252,13 @@ fn validate_timestamps(timestamps: &[f64]) -> HawkesResult<()> {
     if timestamps.windows(2).any(|window| window[1] < window[0]) {
         return Err(HawkesError::UnsortedTimestamps);
     }
+    if let Some(timestamp) = timestamps
+        .windows(2)
+        .find(|window| window[1] == window[0])
+        .map(|window| window[0])
+    {
+        return Err(HawkesError::DuplicateTimestamp(timestamp));
+    }
     if timestamps[timestamps.len() - 1] <= timestamps[0] {
         return Err(HawkesError::InvalidObservationWindow);
     }
@@ -341,6 +350,14 @@ mod tests {
         assert_eq!(shape.multipliers().len(), 4);
         assert!(shape.multipliers().iter().all(|value| *value > 0.0));
         assert!((shape.integrated_multiplier(0.0, 4.0).unwrap() - 4.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn fitted_shape_rejects_duplicate_timestamps() {
+        assert_eq!(
+            PeriodicShape::fit(&[0.0, 1.0, 1.0, 2.0], 2.0, 2, 1.0).unwrap_err(),
+            HawkesError::DuplicateTimestamp(1.0)
+        );
     }
 
     #[test]
