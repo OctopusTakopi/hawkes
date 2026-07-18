@@ -29,10 +29,7 @@ impl MultivariateFitConfig {
                 "max_source_offspring must be finite and in (0, 1)".to_string(),
             ));
         }
-        if !min_baseline_fraction.is_finite()
-            || min_baseline_fraction < 0.0
-            || min_baseline_fraction >= 1.0
-        {
+        if !min_baseline_fraction.is_finite() || !(0.0..1.0).contains(&min_baseline_fraction) {
             return Err(HawkesError::FittingError(
                 "min_baseline_fraction must be finite and in [0, 1)".to_string(),
             ));
@@ -233,10 +230,7 @@ impl MultivariateSumExpHawkes {
         events: &[MultivariateEvent],
         min_baseline_fraction: f64,
     ) -> HawkesResult<Self> {
-        if !min_baseline_fraction.is_finite()
-            || min_baseline_fraction < 0.0
-            || min_baseline_fraction >= 1.0
-        {
+        if !min_baseline_fraction.is_finite() || !(0.0..1.0).contains(&min_baseline_fraction) {
             return Err(HawkesError::FittingError(
                 "min_baseline_fraction must be finite and in [0, 1)".to_string(),
             ));
